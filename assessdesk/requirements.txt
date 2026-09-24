@@ -1,0 +1,8 @@
+PySide6
+keyboard
+rapidocr-onnxruntime
+pillow
+google-genai
+requests
+markdown
+pygments
