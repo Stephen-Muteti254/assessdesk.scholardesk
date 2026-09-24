@@ -1,129 +1,53 @@
-# ExamAssist — Backend API contract
+# ExamAssist desktop — AssessDesk API contract
 
-The desktop client talks to a small HTTP+JSON backend for accounts and
-answer-token accounting. Base URL is configured in `config.API_BASE_URL`
-(default `https://api.examassist.app/v1`, override with the
-`EXAMASSIST_API_URL` environment variable).
+Base URL: `config.API_BASE_URL` (default `https://api.scholardesk.pro/api/v1/assessdesk`,
+override with `EXAMASSIST_API_URL`). JSON everywhere. Errors:
+`{"success": false, "error": {"code", "message", "details"}}`.
 
-- All bodies are `application/json; charset=utf-8`.
-- Authenticated endpoints require `Authorization: Bearer <auth_token>`.
-- Errors use HTTP status ≥ 400 and a JSON body of the shape
-  `{"error": "human readable message"}` (also accepted: `{"message": "..."}`).
+All timestamps are UTC ISO-8601 (`...Z`). Countdowns use the `*_in_seconds`
+fields so a wrong local clock can't change what the user sees.
 
-The client stores `{auth_token, user, tokens}` in
-`%LOCALAPPDATA%/AudioDeviceAgent/session.json`.
+Accounts are created on https://assessdesk.scholardesk.pro (email, name,
+password). Customers, experts and admins sign in with their existing login.
+Each new AssessDesk account gets **5 free questions** (valid 7 days).
 
----
+## Sign-in (password, then 6-digit emailed code)
+1. `POST /auth/login` `{email, password}` → `{otp_session_id}`
+2. `POST /auth/verify-otp` `{otp_session_id, otp, client_device_id, device_name, client_version}`
+   → `{access_token, access_expires_in, refresh_token, device_id, user, balance}`
+3. `POST /auth/resend-otp` `{email}` → `{otp_session_id}`
 
-## 1. `POST /auth/register`
+Access token: 15 min, sent as `Authorization: Bearer`. Refresh token: 30 days,
+**one-time use** (rotated by `POST /auth/refresh {refresh_token}`), kept in the
+Windows Credential Manager. `POST /auth/logout` revokes this device. Max 3
+signed-in devices per account; admins can sign a user out everywhere.
 
-Create a new account.
-
-**Request**
+## Balance
+`GET /me/balance` →
 ```json
-{
-  "full_name": "Jane Doe",
-  "email":     "jane@example.com",
-  "password":  "at-least-8-chars"
-}
+{ "questions_remaining": 17, "tokens": 17, "in_grace": false,
+  "next_expiry": { "questions_remaining": 5, "expires_at": "…Z", "usable_until": "…Z",
+                   "expires_in_seconds": 86000, "usable_for_seconds": 96800, "status": "active" },
+  "grants": [ … ], "warning": { "level": "low", "message": "…" },
+  "low_balance_thresholds": [10, 3, 0], "server_time": "…Z" }
 ```
+`warning.level`: `none | low (≤10) | critical (≤3) | expiring (≤72h / ≤24h) | grace | empty`.
 
-**Response `200 OK`**
-```json
-{
-  "auth_token": "eyJhbGciOi...opaque bearer...",
-  "user": {
-    "id":        "usr_01HZ...",
-    "full_name": "Jane Doe",
-    "email":     "jane@example.com"
-  },
-  "tokens": 25
-}
-```
+Expiry: a batch expires exactly `validity_days × 24h` after purchase. It then
+stays usable for a **3-hour grace window** (user is emailed), then is forfeited.
+Questions are always spent from the batch that expires first.
 
-**Common error responses**
-- `400` — validation failed (`"error": "Password must be at least 8 characters."`)
-- `409` — email already registered
+## Consume
+`POST /me/consume` `{amount: 1, idempotency_key: "<32 hex>", meta?}` → balance.
+Retrying the same key never charges twice. `402 INSUFFICIENT_CREDITS` when empty.
 
----
-
-## 2. `POST /auth/login`
-
-Exchange credentials for a session token.
-
-**Request**
-```json
-{ "email": "jane@example.com", "password": "…" }
-```
-
-**Response `200 OK`** — identical shape to `/auth/register`:
-```json
-{
-  "auth_token": "…",
-  "user": { "id": "usr_…", "full_name": "Jane Doe", "email": "jane@example.com" },
-  "tokens": 17
-}
-```
-
-**Common errors**
-- `401` — `{"error": "Invalid email or password."}`
-
----
-
-## 3. `GET /tokens/balance` &nbsp;·&nbsp; *auth required*
-
-Ask the server how many answer-tokens the current user has. Called at
-launch and then every `TOKEN_REFRESH_SECONDS` (default 10 min) so the
-in-exam pre-check can stay purely local.
-
-**Response `200 OK`**
-```json
-{ "tokens": 17 }
-```
-
-**Common errors**
-- `401` — session expired; client should force sign-in again.
-
----
-
-## 4. `POST /tokens/consume` &nbsp;·&nbsp; *auth required*
-
-Server-authoritative debit, called AFTER the answer has already been
-shown to the user (so nothing blocks their exam). The client also debits
-its cached balance immediately for the pre-check on the next question.
-
-**Request**
-```json
-{
-  "amount": 1,
-  "meta": { "reason": "answer", "client_version": "1.0.4.2" }
-}
-```
-`meta` is optional and free-form; safe to ignore server-side.
-
-**Response `200 OK`** — the new balance after the debit:
-```json
-{ "tokens": 16 }
-```
-
-**Common errors**
-- `402` — insufficient balance (`{"error": "Not enough tokens."}`).
-  On this response the client re-syncs from `/tokens/balance` and shows
-  the "Out of tokens" panel.
-- `401` — session expired.
-
----
-
-## Client behavior summary
-
-| When                                      | Client action                                                              |
-| ----------------------------------------- | -------------------------------------------------------------------------- |
-| App start, no local session               | Show Sign-in dialog; call `/auth/login` or `/auth/register`.               |
-| App start, session present                | Skip dialog; kick off `/tokens/balance` in the background.                 |
-| Hotkey `Ctrl+Alt+Q` pressed               | Check cached `tokens` locally — instant. If < 1, show "Out of tokens".     |
-| Answer returned successfully              | Optimistically `tokens -= 1` locally, then `POST /tokens/consume` async.   |
-| Every 10 minutes                          | `GET /tokens/balance` to reconcile the local cache.                        |
-| Any `401` on an authenticated call        | Clear the session and re-prompt sign-in on next launch.                    |
-
-Purchasing / billing endpoints are intentionally out of scope for this
-milestone.
+## Client behaviour
+| When | Action |
+| --- | --- |
+| No device session | Sign-in dialog (password → code). No sign-up in the app. |
+| Launch / every 10 min | `GET /me/balance` (backoff with jitter on errors), flush queued debits first |
+| Hotkey | Local cached balance check — instant |
+| Answer shown | Queue debit locally (durable), `POST /me/consume` in background |
+| Offline | Debits stay queued with their keys, sent on reconnect |
+| Warning level changes | Shown once per threshold crossing; never over an answer being read |
+| Refresh rejected | Session cleared, user asked to restart and sign in |

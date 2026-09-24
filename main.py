@@ -12,7 +12,9 @@ import os
 import queue
 import sys
 import tempfile
+import random
 import threading
+import time
 
 import keyboard
 
@@ -74,15 +76,101 @@ def drain_queue():
 
 
 # ---------- token sync ----------
+_sync_lock = threading.Lock()
+_backoff_s = 0
+_last_sync_attempt = 0.0
+
+
 def _refresh_balance_async():
     def _t():
+        global _backoff_s, _last_sync_attempt
+        if not _sync_lock.acquire(blocking=False):
+            return  # a sync is already running
         try:
-            n = api_client.get_balance()
-            session.set_tokens(n)
+            # Exponential backoff after failures (timer still fires every tick).
+            if _backoff_s and time.time() - _last_sync_attempt < _backoff_s:
+                return
+            _last_sync_attempt = time.time()
+            _flush_pending_consumes()
+            bal = api_client.get_balance()
+            session.set_balance(bal)
+            _backoff_s = 0
             dispatch(_refresh_idle_if_showing)
+            dispatch(lambda: _maybe_warn(bal))
+        except api_client.AuthExpired:
+            dispatch(_session_ended)
         except api_client.ApiError as e:
-            log.info("[tokens] balance refresh skipped: %s", e)
+            _backoff_s = min(config.TOKEN_REFRESH_MAX_BACKOFF_S,
+                             (_backoff_s * 2 or 15) + random.uniform(0, 5))
+            log.info("[tokens] balance refresh skipped (%s); retry in ~%ds", e, _backoff_s)
+        finally:
+            _sync_lock.release()
     threading.Thread(target=_t, daemon=True).start()
+
+
+def _flush_pending_consumes():
+    """Send debits queued while offline. Idempotency keys make retries safe."""
+    for item in session.pending_consumes():
+        try:
+            bal = api_client.consume(item["idempotency_key"], item["amount"])
+            session.ack_consume(item["idempotency_key"])
+            session.set_balance(bal)
+        except api_client.InsufficientCredits:
+            # Server already knows the true balance; drop the stale debit.
+            session.ack_consume(item["idempotency_key"])
+        except api_client.AuthExpired:
+            raise
+        except api_client.ApiError as e:
+            if e.status and 400 <= e.status < 500:
+                session.ack_consume(item["idempotency_key"])  # unrecoverable, don't loop
+            else:
+                raise  # network/5xx: keep queued, retry later
+
+
+def _maybe_warn(bal):
+    """Show each low-balance / expiry warning once per crossing (Qt thread)."""
+    warning = (bal or {}).get("warning") or {}
+    level, msg = warning.get("level"), warning.get("message")
+    if not msg or level in (None, "none"):
+        session.set_notified("last", None)
+        return
+    remaining = int(bal.get("questions_remaining", 0))
+    nxt = bal.get("next_expiry") or {}
+    key = f"{level}:{remaining if level in ('low', 'critical', 'empty') else nxt.get('id')}"
+    if level in ("low", "critical"):
+        # Re-show only when the balance crosses a lower threshold.
+        prev = session.get_notified("low_threshold")
+        thresholds = bal.get("low_balance_thresholds") or [10, 3, 0]
+        crossed = min([t for t in thresholds if remaining <= t], default=None)
+        if prev is not None and crossed is not None and crossed >= prev:
+            return
+        session.set_notified("low_threshold", crossed)
+    elif session.get_notified("last") == key:
+        return
+    session.set_notified("last", key)
+    if level == "empty":
+        panel.show_out_of_tokens()
+        panel.setVisible(True)
+        return
+    # Never trample an answer the user is reading.
+    if _panel_is_idle():
+        panel.set_message(f"{msg}  Top up: {config.TOPUP_URL}", "warning")
+        panel.setVisible(True)
+    else:
+        _deferred_warning[0] = f"{msg}  Top up: {config.TOPUP_URL}"
+
+
+_deferred_warning = [None]
+
+
+def _panel_is_idle():
+    return bool(panel and panel._sections and len(panel._sections) == 1
+                and panel._sections[0][0] == "html")
+
+
+def _session_ended():
+    panel.set_message("Your session ended. Restart the app to sign in again.", "error")
+    panel.setVisible(True)
 
 
 def _refresh_idle_if_showing():
@@ -99,6 +187,9 @@ def act_toggle():
 
 def act_clear():
     panel.show_idle()
+    if _deferred_warning[0]:
+        msg, _deferred_warning[0] = _deferred_warning[0], None
+        panel.set_message(msg, "warning")
     # Keep visible — the idle cheat sheet IS the "cleared" state, per spec.
     panel.setVisible(True)
 
@@ -136,13 +227,21 @@ def on_selector_finished(rect):
     threading.Thread(target=_pipeline_worker, args=(pix,), daemon=True).start()
 
 
-def _consume_and_reconcile():
-    """Server-authoritative debit. Runs after we already returned the answer."""
+def _consume_and_reconcile(item):
+    """Server-authoritative debit. Runs after the answer is already shown."""
     try:
-        n = api_client.consume_tokens(config.TOKENS_PER_QUESTION)
-        session.set_tokens(n)
+        bal = api_client.consume(item["idempotency_key"], item["amount"])
+        session.ack_consume(item["idempotency_key"])
+        session.set_balance(bal)
+        dispatch(lambda: _maybe_warn(bal))
+    except api_client.InsufficientCredits:
+        session.ack_consume(item["idempotency_key"])
+        _refresh_balance_async()
+    except api_client.AuthExpired:
+        dispatch(_session_ended)
     except api_client.ApiError as e:
-        log.warning("[tokens] consume failed: %s", e)
+        # Offline / server error: stays queued and is flushed on next sync.
+        log.warning("[tokens] consume deferred: %s", e)
 
 
 def _pipeline_worker(pix):
@@ -174,8 +273,8 @@ def _pipeline_worker(pix):
 
     if ok:
         # Optimistic local debit first (instant), then reconcile with server.
-        session.decrement_tokens(config.TOKENS_PER_QUESTION)
-        threading.Thread(target=_consume_and_reconcile, daemon=True).start()
+        item = session.queue_consume(config.TOKENS_PER_QUESTION)
+        threading.Thread(target=_consume_and_reconcile, args=(item,), daemon=True).start()
 
 
 def main():

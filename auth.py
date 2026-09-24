@@ -1,22 +1,28 @@
-"""Sign-in and sign-up windows.
+"""Sign-in window (email + password, then emailed 6-digit code).
 
-These are NORMAL focusable dialogs — deliberately outside the stealth
-pipeline. They're only shown at onboarding, before the invisible overlay
-is armed. Once the user is authenticated they're never displayed again
-(unless the session is cleared or rejected by the server).
+A NORMAL focusable dialog — deliberately outside the stealth pipeline.
+Shown only when there's no device session. Accounts are created and
+topped up on https://assessdesk.scholardesk.pro, so there is no sign-up
+form here.
+
+The native Windows title bar can't be themed from Qt, so the window is
+frameless with its own dark header (drag to move, Esc or x to close).
 """
 import logging
 import re
 import threading
+import webbrowser
 
-from PySide6.QtCore import Qt, Signal, QObject
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QObject, QPoint, Qt, Signal
+from PySide6.QtGui import QFont, QRegularExpressionValidator
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QStackedWidget, QWidget, QFrame, QSizePolicy,
+    QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+    QStackedWidget, QVBoxLayout, QWidget,
 )
+from PySide6.QtCore import QRegularExpression
 
 import api_client
+import config
 import session
 
 log = logging.getLogger("auth")
@@ -24,53 +30,38 @@ log = logging.getLogger("auth")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 STYLE = """
-QDialog, QWidget#Card {
-    background-color: #0f1115;
-    color: #e8eaed;
+QDialog { background-color: #0f1115; }
+QWidget#Root { background-color: #0f1115; border: 1px solid #1e2430; border-radius: 10px; }
+QWidget#TitleBar { background-color: #0f1115; border-top-left-radius: 10px; border-top-right-radius: 10px; }
+QLabel#TitleText { font-size: 12px; color: #9aa4b2; font-weight: 600; }
+QPushButton#Close {
+    background: transparent; border: none; color: #9aa4b2;
+    font-size: 16px; padding: 0 10px; min-width: 32px; min-height: 28px;
 }
-QLabel#Title {
-    font-size: 20px;
-    font-weight: 600;
-    color: #ffffff;
-}
-QLabel#Subtitle {
-    font-size: 12px;
-    color: #9aa4b2;
-}
-QLabel {
-    font-size: 12px;
-    color: #c4ccd6;
-}
+QPushButton#Close:hover { background-color: #c42b1c; color: white; border-radius: 6px; }
+QWidget#Card { background-color: #0f1115; color: #e8eaed; }
+QLabel#Title { font-size: 20px; font-weight: 600; color: #ffffff; }
+QLabel#Subtitle { font-size: 12px; color: #9aa4b2; }
+QLabel { font-size: 12px; color: #c4ccd6; }
 QLineEdit {
-    background-color: #171b22;
-    border: 1px solid #262c36;
-    border-radius: 6px;
-    padding: 9px 11px;
-    font-size: 13px;
-    color: #ffffff;
+    background-color: #171b22; border: 1px solid #262c36; border-radius: 6px;
+    padding: 9px 11px; font-size: 13px; color: #ffffff;
     selection-background-color: #2b6cb0;
 }
 QLineEdit:focus { border: 1px solid #4da3ff; }
+QLineEdit#Otp { font-size: 22px; letter-spacing: 8px; padding: 10px; }
 QPushButton#Primary {
-    background-color: #2f6feb;
-    color: white;
-    border: none;
-    border-radius: 6px;
-    padding: 10px 14px;
-    font-size: 13px;
-    font-weight: 600;
+    background-color: #2f6feb; color: white; border: none; border-radius: 6px;
+    padding: 10px 14px; font-size: 13px; font-weight: 600;
 }
 QPushButton#Primary:hover  { background-color: #3a7cf5; }
 QPushButton#Primary:disabled { background-color: #2a3140; color: #6b7280; }
 QPushButton#Link {
-    background: transparent;
-    border: none;
-    color: #7fb3ff;
-    font-size: 12px;
-    text-align: left;
-    padding: 2px 0;
+    background: transparent; border: none; color: #7fb3ff;
+    font-size: 12px; text-align: left; padding: 2px 0;
 }
 QPushButton#Link:hover { color: #a7cbff; }
+QPushButton#Link:disabled { color: #4b5563; }
 QLabel#Error   { color: #ff8a8a; font-size: 12px; }
 QLabel#Success { color: #7cd992; font-size: 12px; }
 QFrame#Divider { background-color: #1e2430; max-height: 1px; }
@@ -79,222 +70,255 @@ QFrame#Divider { background-color: #1e2430; max-height: 1px; }
 
 class _Worker(QObject):
     """Runs a blocking API call off the UI thread and emits the result."""
-    done = Signal(object, str)  # (payload_or_None, error_or_None)
+    done = Signal(object, str)
 
     def run(self, fn):
         def _target():
             try:
-                payload = fn()
-                self.done.emit(payload, None)
+                self.done.emit(fn(), "")
             except Exception as e:  # includes ApiError
-                self.done.emit(None, str(e))
+                self.done.emit(None, str(e) or "Something went wrong.")
         threading.Thread(target=_target, daemon=True).start()
 
 
-class _FormBase(QWidget):
-    switch = Signal()          # navigate to the other form
-    success = Signal(dict)     # emits the auth payload
+class TitleBar(QWidget):
+    """Dark, draggable replacement for the native title bar."""
+    close_clicked = Signal()
 
-    def __init__(self, title: str, subtitle: str, submit_label: str,
-                 alt_label: str):
+    def __init__(self, title: str):
+        super().__init__()
+        self.setObjectName("TitleBar")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setFixedHeight(36)
+        self._drag = None
+        row = QHBoxLayout(self)
+        row.setContentsMargins(16, 0, 6, 0)
+        t = QLabel(title)
+        t.setObjectName("TitleText")
+        row.addWidget(t)
+        row.addStretch(1)
+        x = QPushButton("\u2715")
+        x.setObjectName("Close")
+        x.setCursor(Qt.PointingHandCursor)
+        x.setToolTip("Close")
+        x.clicked.connect(self.close_clicked.emit)
+        row.addWidget(x)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag = e.globalPosition().toPoint() - self.window().frameGeometry().topLeft()
+            e.accept()
+
+    def mouseMoveEvent(self, e):
+        if self._drag is not None and e.buttons() & Qt.LeftButton:
+            self.window().move(e.globalPosition().toPoint() - self._drag)
+            e.accept()
+
+    def mouseReleaseEvent(self, e):
+        self._drag = None
+
+
+class _Card(QWidget):
+    def __init__(self, title: str, subtitle: str):
         super().__init__()
         self.setObjectName("Card")
-        self._worker = _Worker()
-        self._worker.done.connect(self._on_result)
-
-        root = QVBoxLayout(self)
-        root.setContentsMargins(28, 26, 28, 26)
-        root.setSpacing(12)
-
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.root = QVBoxLayout(self)
+        self.root.setContentsMargins(28, 12, 28, 26)
+        self.root.setSpacing(12)
         t = QLabel(title); t.setObjectName("Title")
-        s = QLabel(subtitle); s.setObjectName("Subtitle")
-        s.setWordWrap(True)
-        root.addWidget(t)
-        root.addWidget(s)
-        root.addSpacing(6)
-
-        self.fields = {}
-        self.build_fields(root)
-
+        self.subtitle = QLabel(subtitle); self.subtitle.setObjectName("Subtitle")
+        self.subtitle.setWordWrap(True)
+        self.root.addWidget(t)
+        self.root.addWidget(self.subtitle)
+        self.root.addSpacing(6)
         self.err = QLabel(""); self.err.setObjectName("Error")
         self.err.setWordWrap(True); self.err.hide()
-        root.addWidget(self.err)
+        self.info = QLabel(""); self.info.setObjectName("Success")
+        self.info.setWordWrap(True); self.info.hide()
+        self._worker = _Worker()
 
-        root.addSpacing(4)
-        self.submit = QPushButton(submit_label)
-        self.submit.setObjectName("Primary")
-        self.submit.setCursor(Qt.PointingHandCursor)
-        self.submit.clicked.connect(self._submit)
-        root.addWidget(self.submit)
+    def show_error(self, msg):
+        self.info.hide(); self.err.setText(msg); self.err.show()
 
-        div = QFrame(); div.setObjectName("Divider"); div.setFrameShape(QFrame.HLine)
-        root.addSpacing(6); root.addWidget(div); root.addSpacing(2)
+    def show_info(self, msg):
+        self.err.hide(); self.info.setText(msg); self.info.show()
 
-        alt = QPushButton(alt_label); alt.setObjectName("Link")
-        alt.setCursor(Qt.PointingHandCursor)
-        alt.clicked.connect(self.switch.emit)
-        root.addWidget(alt)
+    def clear_msgs(self):
+        self.err.hide(); self.info.hide()
 
-        root.addStretch(1)
-
-    # ---- to override ----
-    def build_fields(self, layout):
-        raise NotImplementedError
-
-    def call_api(self) -> dict:
-        raise NotImplementedError
-
-    # ---- helpers ----
-    def _add_field(self, layout, key, label, *, placeholder="", password=False):
-        lbl = QLabel(label)
-        edit = QLineEdit()
-        edit.setPlaceholderText(placeholder)
+    def field(self, label, placeholder="", password=False):
+        self.root.addWidget(QLabel(label))
+        e = QLineEdit(); e.setPlaceholderText(placeholder)
         if password:
-            edit.setEchoMode(QLineEdit.Password)
-        edit.returnPressed.connect(self._submit)
-        layout.addWidget(lbl)
-        layout.addWidget(edit)
-        self.fields[key] = edit
-        return edit
+            e.setEchoMode(QLineEdit.Password)
+        self.root.addWidget(e)
+        return e
 
-    def _show_error(self, msg: str):
-        self.err.setText(msg); self.err.show()
+    def primary(self, text, slot):
+        b = QPushButton(text); b.setObjectName("Primary")
+        b.setCursor(Qt.PointingHandCursor); b.clicked.connect(slot)
+        return b
 
-    def _clear_error(self):
-        self.err.hide(); self.err.setText("")
+    def link(self, text, slot):
+        b = QPushButton(text); b.setObjectName("Link")
+        b.setCursor(Qt.PointingHandCursor); b.clicked.connect(slot)
+        return b
 
-    def _set_busy(self, busy: bool):
-        self.submit.setDisabled(busy)
-        self.submit.setText("Please wait…" if busy else self._label)
+    def divider(self):
+        d = QFrame(); d.setObjectName("Divider"); d.setFrameShape(QFrame.HLine)
+        return d
+
+
+class LoginForm(_Card):
+    otp_sent = Signal(str, str)  # email, otp_session_id
+
+    def __init__(self):
+        super().__init__("Sign in", "Enter your AssessDesk account details. "
+                                    "We'll email you a one-time code to confirm it's you.")
+        self.email = self.field("Email", "you@example.com")
+        self.password = self.field("Password", "Your password", password=True)
+        self.email.returnPressed.connect(self._submit)
+        self.password.returnPressed.connect(self._submit)
+        self.root.addWidget(self.err)
+        self.root.addSpacing(4)
+        self.submit = self.primary("Continue", self._submit)
+        self.root.addWidget(self.submit)
+        self.root.addSpacing(6); self.root.addWidget(self.divider()); self.root.addSpacing(2)
+        self.root.addWidget(self.link("No account or need more questions?  Visit assessdesk.scholardesk.pro",
+                                      lambda: webbrowser.open(config.TOPUP_URL)))
+        self.root.addStretch(1)
+        self._worker.done.connect(self._on_result)
 
     def _submit(self):
-        self._clear_error()
-        try:
-            self._validate()
-        except ValueError as ve:
-            self._show_error(str(ve)); return
-        self._label = self.submit.text()
-        self._set_busy(True)
-        self._worker.run(self.call_api)
+        self.clear_msgs()
+        email = self.email.text().strip()
+        if not _EMAIL_RE.match(email):
+            return self.show_error("Please enter a valid email address.")
+        if not self.password.text():
+            return self.show_error("Password is required.")
+        self._email = email
+        self.submit.setDisabled(True); self.submit.setText("Please wait…")
+        pw = self.password.text()
+        self._worker.run(lambda: api_client.login(email, pw))
 
-    def _validate(self):
-        pass
-
-    def _on_result(self, payload, err):
-        self._set_busy(False)
+    def _on_result(self, otp_session_id, err):
+        self.submit.setDisabled(False); self.submit.setText("Continue")
         if err:
-            self._show_error(err); return
+            return self.show_error(err)
+        self.password.clear()
+        self.otp_sent.emit(self._email, otp_session_id)
+
+
+class OtpForm(_Card):
+    back = Signal()
+    success = Signal(dict)
+
+    def __init__(self):
+        super().__init__("Check your email", "")
+        self.code = self.field("6-digit code", "••••••")
+        self.code.setObjectName("Otp")
+        self.code.setMaxLength(6)
+        self.code.setAlignment(Qt.AlignCenter)
+        self.code.setValidator(QRegularExpressionValidator(QRegularExpression(r"\d{0,6}")))
+        self.code.textChanged.connect(lambda t: len(t) == 6 and self._submit())
+        self.root.addWidget(self.err)
+        self.root.addWidget(self.info)
+        self.root.addSpacing(4)
+        self.submit = self.primary("Verify and sign in", self._submit)
+        self.root.addWidget(self.submit)
+        self.root.addSpacing(6); self.root.addWidget(self.divider()); self.root.addSpacing(2)
+        self.resend = self.link("Didn't get it?  Send a new code", self._resend)
+        self.root.addWidget(self.resend)
+        self.root.addWidget(self.link("Use a different account", self.back.emit))
+        self.root.addStretch(1)
+        self._busy = False
+        self._worker.done.connect(self._on_verify)
+        self._resend_worker = _Worker()
+        self._resend_worker.done.connect(self._on_resend)
+
+    def start(self, email, otp_session_id):
+        self._email, self._otp_session_id = email, otp_session_id
+        self.subtitle.setText(f"We sent a 6-digit code to {email}. It expires in a few minutes.")
+        self.code.clear(); self.clear_msgs(); self.code.setFocus()
+
+    def _submit(self):
+        if self._busy:
+            return
+        code = self.code.text().strip()
+        if len(code) != 6:
+            return self.show_error("Enter the 6-digit code from your email.")
+        self.clear_msgs()
+        self._busy = True
+        self.submit.setDisabled(True); self.submit.setText("Verifying…")
+        sid = self._otp_session_id
+        self._worker.run(lambda: api_client.verify_otp(sid, code))
+
+    def _on_verify(self, payload, err):
+        self._busy = False
+        self.submit.setDisabled(False); self.submit.setText("Verify and sign in")
+        if err:
+            self.code.clear()
+            return self.show_error(err)
         self.success.emit(payload)
 
+    def _resend(self):
+        self.resend.setDisabled(True)
+        email = self._email
+        self._resend_worker.run(lambda: api_client.resend_otp(email))
 
-class LoginForm(_FormBase):
-    def __init__(self):
-        super().__init__(
-            title="Sign in",
-            subtitle="Welcome back. Enter your account details to continue.",
-            submit_label="Sign in",
-            alt_label="New here?  Create an account",
-        )
-
-    def build_fields(self, layout):
-        self._add_field(layout, "email", "Email",
-                        placeholder="you@example.com")
-        self._add_field(layout, "password", "Password",
-                        placeholder="Your password", password=True)
-
-    def _validate(self):
-        if not _EMAIL_RE.match(self.fields["email"].text().strip()):
-            raise ValueError("Please enter a valid email address.")
-        if not self.fields["password"].text():
-            raise ValueError("Password is required.")
-
-    def call_api(self):
-        return api_client.login(
-            self.fields["email"].text().strip(),
-            self.fields["password"].text(),
-        )
-
-
-class RegisterForm(_FormBase):
-    def __init__(self):
-        super().__init__(
-            title="Create your account",
-            subtitle="Get started in seconds. You'll receive a starter "
-                     "balance to try out the assistant.",
-            submit_label="Create account",
-            alt_label="Already have an account?  Sign in",
-        )
-
-    def build_fields(self, layout):
-        self._add_field(layout, "full_name", "Full name",
-                        placeholder="Jane Doe")
-        self._add_field(layout, "email", "Email",
-                        placeholder="you@example.com")
-        self._add_field(layout, "password", "Password",
-                        placeholder="At least 8 characters", password=True)
-
-    def _validate(self):
-        if len(self.fields["full_name"].text().strip()) < 2:
-            raise ValueError("Please enter your full name.")
-        if not _EMAIL_RE.match(self.fields["email"].text().strip()):
-            raise ValueError("Please enter a valid email address.")
-        if len(self.fields["password"].text()) < 8:
-            raise ValueError("Password must be at least 8 characters.")
-
-    def call_api(self):
-        return api_client.register(
-            self.fields["full_name"].text().strip(),
-            self.fields["email"].text().strip(),
-            self.fields["password"].text(),
-        )
+    def _on_resend(self, sid, err):
+        self.resend.setDisabled(False)
+        if err:
+            return self.show_error(err)
+        self._otp_session_id = sid
+        self.show_info("A new code is on its way.")
 
 
 class AuthDialog(QDialog):
-    """Modal onboarding dialog. Emits accepted() when a session is stored."""
+    """Modal onboarding dialog. accept() once a device session is stored."""
 
-    def __init__(self, start_on_register: bool = False):
+    def __init__(self):
         super().__init__()
-        self.setWindowTitle("ExamAssist — Sign in")
+        self.setWindowTitle("ExamAssist : Sign in")
         self.setModal(True)
-        self.setFixedSize(420, 520)
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedSize(420, 540)
         self.setStyleSheet(STYLE)
         self.setFont(QFont("Segoe UI", 10))
-        # Normal, focusable window — no stealth flags here on purpose.
-        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        root = QWidget(); root.setObjectName("Root")
+        root.setAttribute(Qt.WA_StyledBackground, True)
+        outer.addWidget(root)
+        col = QVBoxLayout(root)
+        col.setContentsMargins(1, 1, 1, 1)
+        col.setSpacing(0)
+
+        bar = TitleBar("ExamAssist — Sign in")
+        bar.close_clicked.connect(self.reject)
+        col.addWidget(bar)
 
         self.stack = QStackedWidget()
         self.login = LoginForm()
-        self.register_ = RegisterForm()
+        self.otp = OtpForm()
         self.stack.addWidget(self.login)
-        self.stack.addWidget(self.register_)
+        self.stack.addWidget(self.otp)
+        col.addWidget(self.stack)
 
-        self.login.switch.connect(lambda: self.stack.setCurrentWidget(self.register_))
-        self.register_.switch.connect(lambda: self.stack.setCurrentWidget(self.login))
-        self.login.success.connect(self._store_and_accept)
-        self.register_.success.connect(self._store_and_accept)
+        self.login.otp_sent.connect(self._to_otp)
+        self.otp.back.connect(lambda: self.stack.setCurrentWidget(self.login))
+        self.otp.success.connect(lambda _p: self.accept())
 
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(self.stack)
-
-        if start_on_register:
-            self.stack.setCurrentWidget(self.register_)
-
-    def _store_and_accept(self, payload: dict):
-        token = payload.get("auth_token")
-        user = payload.get("user") or {}
-        tokens = payload.get("tokens")
-        if not token:
-            # defensive — surface a friendly message on either form
-            active = self.stack.currentWidget()
-            active._show_error("Unexpected response from server.")
-            return
-        session.set_auth(token, user, tokens)
-        self.accept()
+    def _to_otp(self, email, sid):
+        self.otp.start(email, sid)
+        self.stack.setCurrentWidget(self.otp)
 
 
 def run_auth_flow(parent=None) -> bool:
-    """Show the auth dialog if there's no valid session. Returns True on success."""
+    """Show the sign-in dialog if there's no device session. True on success."""
     if session.is_authenticated():
         return True
     dlg = AuthDialog()

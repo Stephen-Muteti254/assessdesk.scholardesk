@@ -47,7 +47,7 @@ OCR_UPSCALE = 2
 # --- Backend / accounts ---
 # Point this at your server. Override with EXAMASSIST_API_URL env var.
 API_BASE_URL = os.environ.get(
-    "EXAMASSIST_API_URL", "https://api.examassist.app/v1"
+    "EXAMASSIST_API_URL", "https://api.scholardesk.pro/api/v1/assessdesk"
 ).rstrip("/")
 API_TIMEOUT_S = 8.0
 
@@ -61,3 +61,10 @@ SESSION_FILE = os.path.join(SESSION_DIR, "session.json")
 # authority; local balance is a cache that gets reconciled after every answer.
 TOKENS_PER_QUESTION = 1
 TOKEN_REFRESH_SECONDS = 600  # background balance sync cadence
+TOKEN_REFRESH_MAX_BACKOFF_S = 300  # cap for retry backoff after network errors
+
+# Where users buy more questions (opened from warnings / out-of-tokens panel).
+TOPUP_URL = "https://assessdesk.scholardesk.pro/pricing"
+
+# Refresh token lives in Windows Credential Manager under this service name.
+KEYRING_SERVICE = "AudioDeviceAgent"
